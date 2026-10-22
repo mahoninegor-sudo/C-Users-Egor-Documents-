@@ -1,3 +1,7 @@
 
 # GitHub PAT — НЕ КОММИТИТЬ
 .git-token
+
+
+# GitHub login — не коммитить
+.git-user

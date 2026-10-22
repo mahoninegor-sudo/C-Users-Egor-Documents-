@@ -2,12 +2,17 @@
 """
 push_git.py — коммитит и пушит изменения в GitHub одной командой.
 
+Логин и токен берутся из файлов:
+    .git-user   — создаётся `python save_login.py`
+    .git-token  — создаётся `python create_token.py`
+
 Использование:
     python push_git.py                     # авто-сообщение "update: YYYY-MM-DD HH:MM"
     python push_git.py -m "fix bug"        # своё сообщение
-    python push_git.py --pull              # сначала git pull, потом push
+    python push_git.py --pull              # сначала git pull --rebase
     python push_git.py --dry-run           # показать, что будет сделано
     python push_git.py --branch dev        # другая ветка
+    python push_git.py --require-auth      # упасть, если нет .git-user/.git-token
 """
 
 import argparse
@@ -17,6 +22,7 @@ import subprocess
 import sys
 
 TOKEN_FILE = ".git-token"
+USER_FILE = ".git-user"
 
 
 def fix_console_encoding():
@@ -29,14 +35,10 @@ def fix_console_encoding():
 
 
 def run(cmd, check=True, capture=True):
-    """Запускает команду, возвращает (код, stdout, stderr)."""
     try:
         result = subprocess.run(
-            cmd,
-            capture_output=capture,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            cmd, capture_output=capture, text=True,
+            encoding="utf-8", errors="replace",
         )
     except FileNotFoundError:
         print(f"[!] Команда не найдена: {cmd[0]}")
@@ -80,46 +82,71 @@ def count_changes():
     return added, modified, deleted, len(lines)
 
 
-def setup_auth_env():
-    """
-    Если есть .git-token — подставляет его в URL origin для этого процесса,
-    чтобы не вводить пароль. Не модифицирует .git/config.
-    """
-    if not os.path.exists(TOKEN_FILE):
-        return
-    with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-        token = f.read().strip()
+# ---------- читаем логин/токен из файлов ----------
+
+def read_token():
+    if os.path.exists(TOKEN_FILE):
+        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return os.environ.get("GITHUB_TOKEN", "").strip()
+
+
+def read_user():
+    if os.path.exists(USER_FILE):
+        with open(USER_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    return os.environ.get("GITHUB_USER", "").strip()
+
+
+def check_auth_files(require=False):
+    """Возвращает (user, token). Если чего-то нет — сообщает."""
+    user  = read_user()
+    token = read_token()
+
+    missing = []
+    if not user:
+        missing.append(f"{USER_FILE}  (создать: python save_login.py)")
     if not token:
-        return
+        missing.append(f"{TOKEN_FILE} (создать: python create_token.py)")
+
+    if not missing:
+        return user, token
+
+    print("[!] Не найдены данные для авторизации:")
+    for m in missing:
+        print(f"    • {m}")
+
+    if require:
+        print("\n[!] --require-auth: завершаю без пуша.")
+        sys.exit(1)
+
+    print("\n[i] Продолжаю без подстановки токена — git может спросить пароль.")
+    return user, token
+
+
+def setup_auth_env(user, token):
+    """Подставляет user:token в URL origin. Возвращает исходный URL или None."""
+    if not user or not token:
+        return None
 
     _, out, _ = run(["git", "remote", "get-url", "origin"], check=False)
     url = out.strip()
     if not url.startswith("https://") or "@" in url:
-        return  # SSH или уже с логином — не трогаем
-
-    # Спрашиваем логин один раз (или берём из GITHUB_USER)
-    user = os.environ.get("GITHUB_USER", "").strip()
-    if not user:
-        user = input("GitHub-логин: ").strip()
-    if not user:
-        return
+        return None  # SSH или уже с логином — не трогаем
 
     new_url = url.replace("https://", f"https://{user}:{token}@")
     run(["git", "remote", "set-url", "origin", new_url])
-    print(f"[i] origin настроен с токеном из {TOKEN_FILE}")
+    print(f"[i] origin: подставлен токен (user={user})")
+    return url
 
 
-def restore_remote_url():
-    """Убирает токен из URL origin обратно на чистый https."""
-    _, out, _ = run(["git", "remote", "get-url", "origin"], check=False)
-    url = out.strip()
-    if "://" not in url or "@" not in url:
+def restore_remote_url(original):
+    if not original:
         return
-    # https://user:token@github.com/foo/bar.git -> https://github.com/foo/bar.git
-    clean = url.split("://", 1)[1].split("@", 1)[1]
-    run(["git", "remote", "set-url", "origin", "https://" + clean],
-        check=False)
+    run(["git", "remote", "set-url", "origin", original], check=False)
 
+
+# ---------- main ----------
 
 def main():
     fix_console_encoding()
@@ -135,10 +162,18 @@ def main():
                         help="Только показать, что будет сделано")
     parser.add_argument("--no-token", action="store_true",
                         help="Не подставлять токен из .git-token")
+    parser.add_argument("--require-auth", action="store_true",
+                        help="Упасть, если нет .git-user / .git-token")
     args = parser.parse_args()
 
     os.chdir(os.path.dirname(os.path.abspath(__file__)) or ".")
     ensure_git_repo()
+
+    # Читаем логин/токен заранее — один раз
+    if args.no_token:
+        user, token = "", ""
+    else:
+        user, token = check_auth_files(require=args.require_auth)
 
     branch = args.branch or current_branch()
     if not branch:
@@ -149,7 +184,6 @@ def main():
     # --- проверить изменения ---
     if not has_changes():
         print("[i] Изменений нет — коммит и пуш не нужны.")
-        # Но если ветка ещё не на remote — всё равно пушим
         code, _, _ = run(
             ["git", "rev-parse", "--abbrev-ref", f"origin/{branch}"],
             check=False,
@@ -168,11 +202,9 @@ def main():
                   "git add . → git commit → git push")
             return 0
 
-        # --- git add ---
         print("[→] git add .")
         run(["git", "add", "."])
 
-        # --- git commit ---
         message = args.message or (
             f"update: {datetime.datetime.now():%Y-%m-%d %H:%M}"
         )
@@ -188,25 +220,31 @@ def main():
             print(out.strip() or err.strip())
             return 1
 
-    # --- настройка токена (если есть) ---
-    if not args.no_token:
-        setup_auth_env()
+    # --- пуш с подстановкой токена ---
+    original_url = None
+    if user and token:
+        original_url = setup_auth_env(user, token)
 
-    # --- git push ---
     print(f"[→] git push origin {branch}")
     try:
         code, out, err = run(["git", "push", "origin", branch], check=False)
     finally:
-        if not args.no_token:
-            restore_remote_url()
+        if original_url:
+            restore_remote_url(original_url)
 
     if code != 0:
         # Если ветка не отслеживается — ставим upstream и пробуем снова
         if "no upstream" in (err or out) or "set-upstream" in (err or out):
             print(f"[→] git push -u origin {branch}")
-            code, out, err = run(
-                ["git", "push", "-u", "origin", branch], check=False
-            )
+            if user and token:
+                original_url = setup_auth_env(user, token)
+            try:
+                code, out, err = run(
+                    ["git", "push", "-u", "origin", branch], check=False
+                )
+            finally:
+                if original_url:
+                    restore_remote_url(original_url)
         if code != 0:
             print("[!] push не удался:")
             print((out or err).strip())
