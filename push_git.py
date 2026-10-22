@@ -168,21 +168,22 @@ def report_keep(created, skipped, dry_run):
         print(f"    … и ещё {len(created) - 20}")
 
 
-def _read_credential_file(path):
+def _read_credential_file(base, name):
     """Читает файл без BOM; пустые строки и пробелы по краям отбрасываются."""
+    path = os.path.join(base, name)
     if not os.path.exists(path):
         return ""
     with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
         return f.read().strip()
 
 
-def read_token():
-    return _read_credential_file(TOKEN_FILE) or \
+def read_token(root):
+    return _read_credential_file(root, TOKEN_FILE) or \
         (os.environ.get("GITHUB_TOKEN", "") or "").strip()
 
 
-def read_user():
-    return _read_credential_file(USER_FILE) or \
+def read_user(root):
+    return _read_credential_file(root, USER_FILE) or \
         (os.environ.get("GITHUB_USER", "") or "").strip()
 
 
@@ -310,7 +311,7 @@ def main():
         print("[i] Нечего коммитить — коммит не создаётся.")
 
     # --- auth ---
-    user, token = read_user(), read_token()
+    user, token = read_user(root), read_token(root)
     original_url = None
     if user and token:
         original_url = setup_auth_env(root, user, token)
