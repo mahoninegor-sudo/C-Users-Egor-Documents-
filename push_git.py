@@ -168,24 +168,46 @@ def report_keep(created, skipped, dry_run):
         print(f"    … и ещё {len(created) - 20}")
 
 
+def _read_credential_file(path):
+    """Читает файл без BOM; пустые строки и пробелы по краям отбрасываются."""
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8-sig", errors="replace") as f:
+        return f.read().strip()
+
+
 def read_token():
-    if os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return os.environ.get("GITHUB_TOKEN", "").strip()
+    return _read_credential_file(TOKEN_FILE) or \
+        (os.environ.get("GITHUB_TOKEN", "") or "").strip()
 
 
 def read_user():
-    if os.path.exists(USER_FILE):
-        with open(USER_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return os.environ.get("GITHUB_USER", "").strip()
+    return _read_credential_file(USER_FILE) or \
+        (os.environ.get("GITHUB_USER", "") or "").strip()
+
+
+def valid_username(user):
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", user or ""))
+
+
+def valid_token(token):
+    # GitHub PAT: ghp_..., github_pat_...; допускаем буквы/цифры/подчёркивания
+    return bool(re.fullmatch(r"[A-Za-z0-9_]{20,}", token or ""))
 
 
 def setup_auth_env(root, user, token):
     """Подставляет user:token в URL origin. Возвращает исходный URL или None."""
     if not user or not token:
         return None
+    if not valid_username(user):
+        print(f"[!] .git-user выглядит некорректно ({user!r}) — "
+              f"подстановка токена пропущена.")
+        return None
+    if not valid_token(token):
+        print("[!] .git-token пустой или содержит мусор — подстановка "
+              "токена пропущена (работает Git Credential Manager).")
+        return None
+
     _, out, _ = run(["git", "-C", root, "remote", "get-url", "origin"],
                     check=False)
     url = out.strip()
@@ -289,12 +311,12 @@ def main():
 
     # --- auth ---
     user, token = read_user(), read_token()
-    if not user or not token:
-        print("[i] Нет .git-user / .git-token — используется "
-              "Git Credential Manager.")
     original_url = None
     if user and token:
         original_url = setup_auth_env(root, user, token)
+    else:
+        print("[i] Авторизация: Git Credential Manager "
+              "(нет .git-user/.git-token).")
 
     # --- push ---
     push_cmd = push_command(branch, args)
