@@ -72,7 +72,6 @@ def has_changes():
     _, out, _ = run(["git", "status", "--porcelain"])
     return bool(out.strip())
 
-
 def count_changes():
     _, out, _ = run(["git", "status", "--porcelain"])
     lines = [l for l in out.splitlines() if l.strip()]
@@ -181,16 +180,19 @@ def main():
         sys.exit(1)
     print(f"[i] Ветка: {branch}")
 
-    # --- проверить изменения ---
+        # --- проверить изменения ---
     if not has_changes():
-        print("[i] Изменений нет — коммит и пуш не нужны.")
-        code, _, _ = run(
-            ["git", "rev-parse", "--abbrev-ref", f"origin/{branch}"],
+        # Есть ли неотправленные коммиты?
+        _, out, _ = run(
+            ["git", "rev-list", "--count", f"origin/{branch}..HEAD"],
             check=False,
         )
-        if code != 0:
-            print(f"[i] Ветка {branch} не на remote — пушу.")
+        ahead = int(out.strip() or "0")
+        if ahead > 0:
+            print(f"[i] Изменений нет, но есть {ahead} неотправленных "
+                  f"коммит(ов) — пушу.")
         else:
+            print("[i] Изменений нет и всё отправлено — делать нечего.")
             return 0
     else:
         added, modified, deleted, total = count_changes()
