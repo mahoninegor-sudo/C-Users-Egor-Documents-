@@ -1,9 +1,12 @@
 import http.server
-import socketserver
-import webbrowser
 import os
+import re
+import socketserver
+import subprocess
+import sys
 import threading
 import urllib.parse
+import webbrowser
 import html
 import mimetypes
 import json
@@ -17,6 +20,88 @@ COMMON_EXTS = [
 ]
 
 MAX_COPY_BYTES = 20 * 1024 * 1024  # лимит на ответ /copy-content
+
+# --- GitHub: заливка репозитория через push_git.py ---
+PUSH_SCRIPT = os.path.join(ROOT, "push_git.py")
+PUSH_TIMEOUT_SEC = 180
+
+
+def _git(*args, cwd=None, timeout=15):
+    """Запускает git и возвращает CompletedProcess (или None, если git нет)."""
+    try:
+        return subprocess.run(
+            ["git", *args], cwd=cwd or ROOT, capture_output=True,
+            text=True, encoding="utf-8", errors="replace", timeout=timeout,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def repo_root(path=None):
+    """Корень git-репозитория, в котором лежит path (по умолчанию ROOT)."""
+    res = _git("-C", path or ROOT, "rev-parse", "--show-toplevel")
+    if res is None or res.returncode != 0:
+        return None
+    out = res.stdout.strip()
+    return os.path.normpath(out) if out else None
+
+
+def repo_info():
+    """Короткая сводка о репозитории для страницы."""
+    root = repo_root()
+    if not root:
+        return None
+
+    def val(*args):
+        res = _git("-C", root, *args)
+        return res.stdout.strip() if res and res.returncode == 0 else ""
+
+    return {
+        "root": root,
+        "branch": val("rev-parse", "--abbrev-ref", "HEAD"),
+        "remote": val("remote", "get-url", "origin"),
+        "last": val("log", "-1", "--pretty=%h %s"),
+    }
+
+
+def hide_credentials(url):
+    """Убирает логин/токен из https-URL для показа в браузере."""
+    return re.sub(r"//[^/@]+@", "//", url or "")
+
+
+def push_to_github():
+    """
+    Заливает на GitHub репозиторий, в котором лежит ROOT.
+
+    Вызывает push_git.py: он коммитит актуальное состояние и делает push,
+    поэтому на GitHub оказывается точная копия репозитория вместе со всеми
+    папками (пустые папки сохраняются через .gitkeep).
+
+    Возвращает (успех, лог).
+    """
+    script = PUSH_SCRIPT
+    if not os.path.isfile(script):
+        root = repo_root()
+        if root and os.path.isfile(os.path.join(root, "push_git.py")):
+            script = os.path.join(root, "push_git.py")
+    if not os.path.isfile(script):
+        return False, f"push_git.py не найден: {script}"
+
+    try:
+        res = subprocess.run(
+            [sys.executable, script, ROOT],
+            cwd=ROOT, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=PUSH_TIMEOUT_SEC,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"push_git.py не ответил за {PUSH_TIMEOUT_SEC} с."
+    except OSError as e:
+        return False, f"Не удалось запустить push_git.py: {e}"
+
+    out = (res.stdout or "").strip()
+    err = (res.stderr or "").strip()
+    log = out + ("\n\n" + err if err else "")
+    return res.returncode == 0, log.strip()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -44,6 +129,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.handle_create_file(data)
         elif parsed.path == "/create-folder":
             self.handle_create_folder(data)
+        elif parsed.path == "/push-github":
+            self.handle_push_github(data)
         else:
             self.send_error(404, "Не найдено")
 
@@ -92,6 +179,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         rel_dir = data.get("dir", [""])[0]
         name = self.sanitize_name(data.get("name", [""])[0])
         ext = data.get("ext", [""])[0]
+        push_requested = data.get("push", [""])[0] == "1"
 
         if ext == "__custom__":
             ext = data.get("ext_custom", [""])[0]
@@ -118,12 +206,21 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.error_page(f"Ошибка создания: {e}", rel_dir)
             return
 
+        if push_requested:
+            ok, log = push_to_github()
+            self.show_action_result(
+                f"Файл создан: {filename}", rel_dir,
+                push_ok=ok, push_log=log,
+            )
+            return
+
         self.redirect(self.dir_url(rel_dir))
 
     # ---------- создание папки ----------
     def handle_create_folder(self, data):
         rel_dir = data.get("dir", [""])[0]
         name = self.sanitize_name(data.get("name", [""])[0])
+        push_requested = data.get("push", [""])[0] == "1"
 
         dir_full = self.safe_path(rel_dir)
         if dir_full is None or not os.path.isdir(dir_full):
@@ -143,7 +240,67 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.error_page(f"Ошибка создания: {e}", rel_dir)
             return
 
+        if push_requested:
+            ok, log = push_to_github()
+            self.show_action_result(
+                f"Папка создана: {name}", rel_dir,
+                push_ok=ok, push_log=log,
+            )
+            return
+
         self.redirect(self.dir_url(rel_dir))
+
+    # ---------- отправка репозитория на GitHub ----------
+    def handle_push_github(self, data):
+        rel_dir = data.get("dir", [""])[0]
+        if self.safe_path(rel_dir) is None:
+            rel_dir = ""
+        ok, log = push_to_github()
+        self.show_action_result(
+            "Отправка на GitHub", rel_dir,
+            push_ok=ok, push_log=log,
+        )
+
+    def show_action_result(self, title, rel_dir="", *, push_ok=None,
+                           push_log=""):
+        """Страница «что сделали» с результатом push_git.py."""
+        back = self.dir_url(rel_dir)
+
+        banner = ""
+        if push_ok is True:
+            banner = '<p class="ok">✅ Репозиторий загружен на GitHub</p>'
+        elif push_ok is False:
+            banner = ('<p class="err">❌ Загрузить на GitHub не удалось</p>'
+                      '<p class="hint">Файлы на диске сохранены. '
+                      'Исправьте причину и нажмите «Загрузить в GitHub» '
+                      'ещё раз.</p>')
+
+        log_block = ""
+        if push_log:
+            log_block = (
+                '<details open><summary>Лог push_git.py</summary>'
+                f'<pre>{html.escape(push_log)}</pre></details>'
+            )
+
+        self.send_html(f"""<!DOCTYPE html>
+<html lang="ru"><head><meta charset="utf-8">
+<title>{html.escape(title)}</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; margin: 2em; max-width: 900px; }}
+  .ok {{ color: #1a7f37; font-weight: 600; }}
+  .err {{ color: #cf222e; font-weight: 600; }}
+  .hint {{ color: #57606a; font-size: 14px; }}
+  pre {{ background: #f6f8fa; padding: 1em; border-radius: 6px;
+         overflow: auto; font-size: 12.5px; line-height: 1.4;
+         white-space: pre-wrap; word-break: break-word; }}
+  summary {{ cursor: pointer; color: #57606a; }}
+</style></head>
+<body>
+<p><a href="{back}">← К папке</a></p>
+<h2>{html.escape(title)}</h2>
+{banner}
+{log_block}
+</body></html>""")
 
     # ---------- копирование содержимого директории ----------
     def handle_copy_content(self, query):
@@ -209,6 +366,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    # ---------- карточка GitHub ----------
+    def github_card(self, info, rel_esc):
+        """Карточка в тулбаре: заливка всего репозитория на GitHub."""
+        if not info:
+            return """
+  <div class="card">
+    <h3>☁ GitHub</h3>
+    <p class="note warn">Папка не в git-репозитории — заливка недоступна.</p>
+  </div>"""
+
+        remote = hide_credentials(info.get("remote", "")) or "(origin не задан)"
+        branch = info.get("branch") or "?"
+        last = info.get("last") or ""
+        last_html = (f'<div class="repo dim">{html.escape(last)}</div>'
+                     if last else "")
+        return f"""
+  <div class="card">
+    <h3>☁ GitHub</h3>
+    <p class="note">Весь репозиторий — через push_git.py</p>
+    <div class="repo">🌿 {html.escape(branch)} · {html.escape(remote)}</div>
+    {last_html}
+    <form method="post" action="/push-github" onsubmit="pushSubmit(this)">
+      <input type="hidden" name="dir" value="{rel_esc}">
+      <button type="submit">☁ Загрузить в GitHub</button>
+    </form>
+  </div>"""
+
     # ---------- листинг папки ----------
     def show_dir(self, rel):
         full = self.safe_path(rel)
@@ -241,6 +425,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         ext_options = "\n".join(
             f'<option value="{e}">{e}</option>' for e in COMMON_EXTS
         )
+        push_card = self.github_card(repo_info(), rel_esc)
 
         self.send_html(f"""<!DOCTYPE html>
 <html lang="ru"><head><meta charset="utf-8">
@@ -272,6 +457,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
   .card button:hover {{ background: #2c974b; }}
   .card button:disabled {{ background: #94d3a2; cursor: wait; }}
   .status {{ font-size: 13px; color: #555; margin-left: .6em; }}
+  .note {{ font-size: 13px; color: #666; margin: .2em 0 .6em; }}
+  .note.warn {{ color: #a15c00; }}
+  .repo {{ font-size: 12.5px; color: #444; margin: .2em 0 .5em;
+          word-break: break-all; max-width: 320px; }}
+  .repo.dim {{ color: #888; }}
+  .push-chk {{ display: inline-flex; align-items: center; gap: .35em;
+              font-size: 13px; color: #444; white-space: nowrap; }}
+  .push-chk input {{ margin: 0; }}
 </style></head>
 <body>
 <h2>Содержимое: /{rel_esc}</h2>
@@ -291,6 +484,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
       <input name="ext_custom" id="ext-custom" placeholder="своё расширение"
              style="display:none" autocomplete="off">
       <button type="submit">Создать</button>
+      <label class="push-chk"
+             title="После создания залить весь репозиторий на GitHub">
+        <input type="checkbox" name="push" value="1" checked> ⬆ в GitHub
+      </label>
     </form>
   </div>
 
@@ -300,6 +497,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
       <input type="hidden" name="dir" value="{rel_esc}">
       <input name="name" placeholder="имя папки" required autocomplete="off">
       <button type="submit">Создать</button>
+      <label class="push-chk"
+             title="После создания залить весь репозиторий на GitHub">
+        <input type="checkbox" name="push" value="1" checked> ⬆ в GitHub
+      </label>
     </form>
   </div>
 
@@ -311,6 +512,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     <button type="button" id="copy-btn" onclick="copyAll()">📋 Скопировать</button>
     <span class="status" id="copy-status"></span>
   </div>
+
+  {push_card}
 
 </div>
 
@@ -330,6 +533,14 @@ function onExtChange() {{
   }} else {{
     inp.style.display = 'none';
   }}
+}}
+
+function pushSubmit(form) {{
+  // push_git.py может работать несколько секунд — блокируем кнопку
+  var btn = form.querySelector('button');
+  if (!btn) return;
+  btn.disabled = true;
+  btn.textContent = 'Загружаю…';
 }}
 
 async function copyTextToClipboard(text) {{

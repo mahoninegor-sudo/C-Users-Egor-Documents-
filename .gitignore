@@ -5,3 +5,12 @@
 
 # GitHub login — не коммитить
 .git-user
+
+
+# Python
+__pycache__/
+*.pyc
+
+
+# Резервные копии revisions.py --backup
+.revisions_backup/
